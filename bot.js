@@ -5580,6 +5580,10 @@ async processCallbackActionInternal(chatId, userId, action, params, messageId, i
       await this.showPlacesForEdit(chatId, await this.getCityNameFromKey(params[0]), parseInt(params[1]));
       break;
 
+    case 'city_cat_page':
+      await this.handleCitySelection(chatId, params[0], isAdmin, parseInt(params[1]));
+      break;
+
     case 'user_category_page':
       await this.showPlacesByCategory(chatId, params[0], params[1], parseInt(params[2]));
       break;
@@ -6162,8 +6166,9 @@ async showCitySelection(chatId, isAdmin = false) {
   }
 }
 
-// 1. handleCitySelection - сортировка категорий
-async handleCitySelection(chatId, cityKey, isAdmin) {
+
+// 1. handleCitySelection - сортировка категорий с пагинацией
+async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
   const cityName = await this.getCityNameFromKey(cityKey);
   
   this.userStates.set(chatId, { 
@@ -6173,13 +6178,40 @@ async handleCitySelection(chatId, cityKey, isAdmin) {
   
   const categories = await categoryManager.getAllCategories();
   const stats = await placeManager.getCityStats(cityName);
-  
   const cityData = await cityManager.getCityData(cityName);
   
-  let message = `🏙️ *${cityName}*\n\n`;
-  message += `Выберите категорию:\n\n`;
+  // Собираем категории с местами
+  const categoriesWithPlaces = [];
+  for (const category of categories) {
+    const count = stats.categoriesCount[category.id] ? stats.categoriesCount[category.id].count : 0;
+    if (count > 0) {
+      categoriesWithPlaces.push({ ...category, count });
+    }
+  }
   
-  // Добавляем фото города в начало (для превью)
+  // Сортируем по алфавиту
+  categoriesWithPlaces.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+  
+  // Если нет категорий с местами — показываем все
+  const allCategories = categoriesWithPlaces.length > 0
+    ? categoriesWithPlaces
+    : [...categories].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+  
+  // Пагинация: 10 категорий на страницу
+  const pageSize = 10;
+  const totalPages = Math.ceil(allCategories.length / pageSize);
+  const currentPage = Math.max(0, Math.min(page, totalPages - 1));
+  const start = currentPage * pageSize;
+  const pageCategories = allCategories.slice(start, start + pageSize);
+  
+  let message = `🏙️ *${cityName}*\n\n`;
+  if (totalPages > 1) {
+    message += `Выберите категорию (стр. ${currentPage + 1}/${totalPages}):\n\n`;
+  } else {
+    message += `Выберите категорию:\n\n`;
+  }
+  
+  // Фото города
   if (cityData && cityData.photo) {
     if (cityData.photo.url) {
       message = `[​](${cityData.photo.url})` + message;
@@ -6188,49 +6220,28 @@ async handleCitySelection(chatId, cityKey, isAdmin) {
     }
   }
   
-  const inlineKeyboard = {
-    inline_keyboard: []
-  };
+  const inlineKeyboard = { inline_keyboard: [] };
   
-  // Собираем категории с количеством мест
-  const categoriesWithPlaces = [];
-  for (const category of categories) {
-    const count = stats.categoriesCount[category.id] ? stats.categoriesCount[category.id].count : 0;
-    if (count > 0) {
-      categoriesWithPlaces.push({
-        ...category,
-        count: count
-      });
-    }
-  }
-  
-  // ✅ СОРТИРУЕМ КАТЕГОРИИ ПО АЛФАВИТУ (по имени)
-  categoriesWithPlaces.sort((a, b) => {
-    return a.name.localeCompare(b.name, 'ru');
-  });
-  
-  // Добавляем отсортированные категории в inline кнопки
-  for (let i = 0; i < categoriesWithPlaces.length; i += 2) {
-    const row = categoriesWithPlaces.slice(i, i + 2).map(cat => ({
-      text: `${cat.emoji} ${cat.name} (${cat.count})`,
+  // Кнопки категорий по 2 в ряд, БЕЗ числа мест
+  for (let i = 0; i < pageCategories.length; i += 2) {
+    const row = pageCategories.slice(i, i + 2).map(cat => ({
+      text: `${cat.emoji} ${cat.name}`,
       callback_data: `select_category:${cityKey}:${cat.id}`
     }));
     inlineKeyboard.inline_keyboard.push(row);
   }
   
-  // Если нет категорий с местами, показываем все (тоже отсортированные)
-  if (categoriesWithPlaces.length === 0) {
-    // ✅ СОРТИРУЕМ ВСЕ КАТЕГОРИИ
-    const sortedCategories = [...categories].sort((a, b) => {
-      return a.name.localeCompare(b.name, 'ru');
-    });
-    
-    for (let i = 0; i < sortedCategories.length; i += 2) {
-      const row = sortedCategories.slice(i, i + 2).map(cat => ({
-        text: `${cat.emoji} ${cat.name}`,
-        callback_data: `select_category:${cityKey}:${cat.id}`
-      }));
-      inlineKeyboard.inline_keyboard.push(row);
+  // Навигация по страницам
+  if (totalPages > 1) {
+    const navRow = [];
+    if (currentPage > 0) {
+      navRow.push({ text: '⬅️ Назад', callback_data: `city_cat_page:${cityKey}:${currentPage - 1}` });
+    }
+    if (currentPage < totalPages - 1) {
+      navRow.push({ text: 'Далее ➡️', callback_data: `city_cat_page:${cityKey}:${currentPage + 1}` });
+    }
+    if (navRow.length > 0) {
+      inlineKeyboard.inline_keyboard.push(navRow);
     }
   }
   
@@ -6241,7 +6252,6 @@ async handleCitySelection(chatId, cityKey, isAdmin) {
     ]);
   }
   
-  // Отправляем информацию о городе с inline-кнопками
   await this.sendAndTrack(chatId, message, {
     parse_mode: 'Markdown',
     reply_markup: inlineKeyboard
