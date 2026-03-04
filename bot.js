@@ -76,6 +76,9 @@ class CityGuideBot {
     this.photoMessages = new Map();
     this.userPhotos = new Map();
     this.lastBotMessages = new Map();
+    this.mainMessageId = new Map();
+    this.mainMessageId = new Map();
+    this.mainMessageIsPhoto = new Map();
     this.adminSessions = new Map();
     this.adsManager = adsManager;
     this.firebaseDB = firebaseDatabase;
@@ -255,6 +258,45 @@ setTimeout(async () => {
   //   return result;
   // }
 
+async editOrSend(chatId, text, options = {}, photoUrl = null) {
+  const mainMsgId = this.mainMessageId.get(chatId);
+
+  // Если есть фото — добавляем невидимую ссылку в начало текста
+  const textWithPhoto = photoUrl
+    ? `<a href="${this.escapeHtmlAttribute(photoUrl)}">​</a>${text}`
+    : text;
+
+  if (mainMsgId) {
+    try {
+      await this.bot.editMessageText(textWithPhoto, {
+        chat_id: chatId,
+        message_id: mainMsgId,
+        parse_mode: options.parse_mode || 'HTML',
+        reply_markup: options.reply_markup,
+        disable_web_page_preview: false  // ← обязательно false чтобы превью работало
+      });
+      return { message_id: mainMsgId };
+
+    } catch (error) {
+      if (error.message?.includes('message is not modified')) {
+        return { message_id: mainMsgId };
+      }
+      console.log(`⚠️ editOrSend ошибка редактирования: ${error.message}`);
+      try { await this.bot.deleteMessage(chatId, mainMsgId); } catch (e) {}
+      this.mainMessageId.delete(chatId);
+    }
+  }
+
+  // Отправляем новое сообщение
+  const msg = await this.bot.sendMessage(chatId, textWithPhoto, {
+    ...options,
+    parse_mode: options.parse_mode || 'HTML',
+    disable_web_page_preview: false  // ← false чтобы превью работало
+  });
+
+  this.mainMessageId.set(chatId, msg.message_id);
+  return msg;
+}
 async syncLocalDataToFirebase() {
   try {
     console.log('🔄 Начинаю синхронизацию локальных данных с Firebase...');
@@ -1558,7 +1600,7 @@ async confirmDeleteSocial(chatId, cityKey, placeId, socialIndex) {
   }
 
   // Сохранение ID отправленного сообщения (только для обычных пользователей)
-  async sendAndTrack(chatId, text, options = {}) {
+ async sendAndTrack(chatId, text, options = {}) {
     // Валидация и очистка клавиатуры перед отправкой
     if (options.reply_markup && options.reply_markup.inline_keyboard) {
       this.cleanInlineKeyboard(options.reply_markup);
@@ -1567,6 +1609,11 @@ async confirmDeleteSocial(chatId, cityKey, placeId, socialIndex) {
       options.reply_markup.inline_keyboard = options.reply_markup.inline_keyboard
         .map(row => row.filter(button => button.url || button.callback_data))
         .filter(row => row.length > 0);
+    }
+    
+    // ✅ ИСПРАВЛЕНИЕ: Удаляем старые сообщения перед отправкой нового (только не для админ-сессий)
+    if (!this.isInAdminSession(chatId)) {
+      await this.deleteLastMessage(chatId);
     }
     
     const message = await this.bot.sendMessage(chatId, text, options);
@@ -1583,7 +1630,6 @@ async confirmDeleteSocial(chatId, cityKey, placeId, socialIndex) {
     
     return message;
   }
-
   // Для админ-панели: отправка без отслеживания
  async sendAdminMessage(chatId, text, options = {}) {
   try {
@@ -1620,7 +1666,12 @@ async confirmDeleteSocial(chatId, cityKey, placeId, socialIndex) {
 }
 
   // Отправка фото с отслеживанием (только для обычных пользователей)
-  async sendPhotoAndTrack(chatId, photo, options = {}) {
+ async sendPhotoAndTrack(chatId, photo, options = {}) {
+    // ✅ ИСПРАВЛЕНИЕ: Удаляем старые сообщения перед отправкой нового (только не для админ-сессий)
+    if (!this.isInAdminSession(chatId)) {
+      await this.deleteLastMessage(chatId);
+    }
+    
     const message = await this.bot.sendPhoto(chatId, photo, options);
     
     // Не отслеживаем фото в админ-сессиях
@@ -3493,59 +3544,52 @@ async showPlaceDetails(chatId, cityKey, placeId, userId = null) {
     }
 
     if (!place) {
-      await this.sendAndTrack(chatId, '❌ Место не найдено.');
+      await this.editOrSend(chatId, '❌ Место не найдено.', {}, null);
       return;
     }
 
     const category = await categoryManager.getCategoryById(place.category_id);
 
-    // 🖼️ ПОЛУЧАЕМ URL ПЕРВОГО ФОТО ДЛЯ ПРЕВЬЮ
-let photoUrl = null;
+    // 🖼️ ПОЛУЧАЕМ URL ПЕРВОГО ФОТО
+    let photoUrl = null;
+    if (place.photos && Array.isArray(place.photos) && place.photos.length > 0) {
+      const photo = place.photos[0];
+      if (photo && typeof photo === 'object' && photo.url) {
+        photoUrl = photo.url;
+      } else if (typeof photo === 'string' && photo.startsWith('http')) {
+        photoUrl = photo;
+      }
+    }
 
-if (place.photos && Array.isArray(place.photos) && place.photos.length > 0) {
-  const photo = place.photos[0];
-  if (photo && typeof photo === 'object' && photo.url) {
-    photoUrl = photo.url;
-  } else if (typeof photo === 'string' && photo.startsWith('http')) {
-    photoUrl = photo;
-  }
-}
+    // ✅ ФОРМИРУЕМ СООБЩЕНИЕ (без невидимой ссылки на фото — теперь фото передаётся отдельно)
+    let message = '';
 
-// ✅ ФОРМИРУЕМ СООБЩЕНИЕ С БЕЗОПАСНЫМ HTML
-let message = '';
+  
+    const safeName = this.escapeHtml(place.name);
+    const safeCategoryName = this.escapeHtml(category.name);
+    const safeAddress = place.address ? this.escapeHtml(place.address) : 'не указан';
+    const safeHours = place.working_hours ? this.cleanWorkingHours(place.working_hours) : 'не указано';
+    const safePrice = place.average_price ? this.escapeHtml(place.average_price) : null;
+    const safeDescription = place.description ? this.escapeHtml(place.description) : 'Нет описания';
+    const safePhone = place.phone ? this.escapeHtml(place.phone) : null;
 
-// ✅ ИСПРАВЛЕНИЕ: экранируем URL для атрибута href
-if (photoUrl) {
-  const escapedUrl = this.escapeHtmlAttribute(photoUrl);
-  message += `<a href="${escapedUrl}">&#8203;</a>`;
-}
+    message += `🏛️ <b>${safeName}</b>\n`;
+    message += `📁 ${category.emoji} ${safeCategoryName}\n\n`;
+    message += `📍 <b>Адрес:</b> ${safeAddress}\n`;
+    message += `⏰ <b>Время работы:</b> ${safeHours}\n`;
 
-// 🔥 Безопасный HTML текст (экранируем все поля)
-const safeName = this.escapeHtml(place.name);
-const safeCategoryName = this.escapeHtml(category.name);
-const safeAddress = place.address ? this.escapeHtml(place.address) : 'не указан';
-const safeHours = place.working_hours ? this.cleanWorkingHours(place.working_hours) : 'не указано';
-const safePrice = place.average_price ? this.escapeHtml(place.average_price) : null;
-const safeDescription = place.description ? this.escapeHtml(place.description) : 'Нет описания';
-const safePhone = place.phone ? this.escapeHtml(place.phone) : null;
+    if (safePrice) {
+      message += `💰 <b>Средний чек:</b> ${safePrice}\n`;
+    }
 
-message += `🏛️ <b>${safeName}</b>\n`;
-message += `📁 ${category.emoji} ${safeCategoryName}\n\n`;
-message += `📍 <b>Адрес:</b> ${safeAddress}\n`;
-message += `⏰ <b>Время работы:</b> ${safeHours}\n`;
+    message += `\n📝 <b>Описание:</b>\n${safeDescription}\n`;
 
-if (safePrice) {
-  message += `💰 <b>Средний чек:</b> ${safePrice}\n`;
-}
+    if (safePhone) {
+      message += `\n📞 <b>Телефон:</b> ${safePhone}\n`;
+    }
 
-message += `\n📝 <b>Описание:</b>\n${safeDescription}\n`;
-
-if (safePhone) {
-  message += `\n📞 <b>Телефон:</b> ${safePhone}\n`;
-}
-    // Остальной код без изменений...
+    // Социальные сети в тексте
     const socialLinks = this.getValidSocialLinks(place);
-    
     if (socialLinks && Object.keys(socialLinks).length > 0) {
       message += `\n📱 <b>Социальные сети:</b>\n`;
       Object.entries(socialLinks).forEach(([name, url]) => {
@@ -3554,38 +3598,26 @@ if (safePhone) {
       });
     }
 
-    const inlineKeyboard = {
-      inline_keyboard: []
-    };
+    // ====== СТРОИМ КЛАВИАТУРУ ======
+    const inlineKeyboard = { inline_keyboard: [] };
 
-    // КНОПКИ СОЦСЕТЕЙ
+    // Кнопки соцсетей
     if (socialLinks && Object.keys(socialLinks).length > 0) {
       const socialEntries = Object.entries(socialLinks);
-      
       for (let i = 0; i < socialEntries.length; i += 2) {
         const row = socialEntries.slice(i, i + 2).map(([name, url]) => {
           const icon = this.getSocialIcon(url);
           const normalizedUrl = this.normalizeSocialUrl(url);
-          
-          if (!normalizedUrl || normalizedUrl.trim() === '') {
-            return null;
-          }
-          
+          if (!normalizedUrl || normalizedUrl.trim() === '') return null;
           const urlToUse = normalizedUrl.startsWith('http') ? normalizedUrl : `https://${normalizedUrl}`;
-          
-          return {
-            text: `${icon}`,
-            url: urlToUse
-          };
-        }).filter(button => button !== null);
-        
-        if (row.length > 0) {
-          inlineKeyboard.inline_keyboard.push(row);
-        }
+          return { text: `${icon}`, url: urlToUse };
+        }).filter(Boolean);
+
+        if (row.length > 0) inlineKeyboard.inline_keyboard.push(row);
       }
     }
 
-    // КНОПКИ САЙТА И КАРТЫ
+    // Кнопка сайта
     if (place.website) {
       const normalizedWebsite = this.normalizeSocialUrl(place.website);
       if (normalizedWebsite && normalizedWebsite.trim() !== '') {
@@ -3596,6 +3628,7 @@ if (safePhone) {
       }
     }
 
+    // Кнопка карты
     if (place.map_url) {
       const normalizedMapUrl = this.normalizeSocialUrl(place.map_url);
       if (normalizedMapUrl && normalizedMapUrl.trim() !== '') {
@@ -3606,76 +3639,53 @@ if (safePhone) {
       }
     }
 
-    // КНОПКИ ТАКСИ
+    // Кнопка Uber
     if (place.latitude && place.longitude) {
       const uberLink = this.getUberLinkForPlace(place);
-      
       if (uberLink) {
         inlineKeyboard.inline_keyboard.push([
-          {
-            text: '🚗 Вызвать Uber',
-            url: uberLink
-          }
+          { text: '🚗 Вызвать Uber', url: uberLink }
         ]);
       }
     }
 
-    // КНОПКА "СКОПИРОВАТЬ НОМЕР"
+    // Кнопка телефона
     if (place.phone) {
       inlineKeyboard.inline_keyboard.push([
-        {
-          text: '📋 Скопировать телефон',
-          callback_data: `copy_phone:${cityKey}:${placeId}`
-        }
+        { text: '📋 Скопировать телефон', callback_data: `copy_phone:${cityKey}:${placeId}` }
       ]);
     }
 
-    // КНОПКА "РЕДАКТИРОВАТЬ СОЦСЕТИ" (ТОЛЬКО ДЛЯ АДМИНОВ)
+    // Кнопка редактирования (только для админов)
     const isAdmin = this.isUserAdmin(userId);
     if (isAdmin) {
       inlineKeyboard.inline_keyboard.push([
-      { 
-        text: '✏️ Редактировать место', 
-        callback_data: `edit_place_select:${cityKey}:${placeId}` 
-      }
+        { text: '✏️ Редактировать место', callback_data: `edit_place_select:${cityKey}:${placeId}` }
       ]);
     }
 
-    // КНОПКА "ЧТО-ТО НЕ ТАК?"
+    // Кнопка "Что-то не так?"
     inlineKeyboard.inline_keyboard.push([
-      { 
-        text: '⚠️ Что-то не так?', 
-        callback_data: `report_issue:${cityKey}:${placeId}` 
-      }
+      { text: '⚠️ Что-то не так?', callback_data: `report_issue:${cityKey}:${placeId}` }
     ]);
 
-    // КНОПКИ НАВИГАЦИИ
+    // Навигация
     const navigationRow = [];
-
     if (place.category_id) {
-      navigationRow.push({ 
-        text: '🔙 К категории', 
-        callback_data: `select_category:${cityKey}:${place.category_id}` 
+      navigationRow.push({
+        text: '🔙 К категории',
+        callback_data: `select_category:${cityKey}:${place.category_id}`
       });
     }
-
-    navigationRow.push({ 
-      text: '🔙 К городу', 
-      callback_data: `select_city:${cityKey}` 
-    });
-
-    navigationRow.push({ 
-      text: '🏠 Главное меню', 
-      callback_data: 'back:main_menu' 
-    });
-
+    navigationRow.push({ text: '🔙 К городу', callback_data: `select_city:${cityKey}` });
+    navigationRow.push({ text: '🏠 Главное меню', callback_data: 'back:main_menu' });
     inlineKeyboard.inline_keyboard.push(navigationRow);
 
-    // ВАЛИДАЦИЯ И ОЧИСТКА КЛАВИАТУРЫ
+    // Валидация клавиатуры
     this.cleanInlineKeyboard(inlineKeyboard);
-    
+
     if (!this.validateReplyMarkup(inlineKeyboard)) {
-      console.error('❌ Некорректная клавиатура после очистки');
+      console.error('❌ Некорректная клавиатура после очистки, использую упрощённую');
       const simpleKeyboard = {
         inline_keyboard: [
           [
@@ -3687,42 +3697,46 @@ if (safePhone) {
           ]
         ]
       };
-      
+
       const simpleMessage = `🏛️ ${place.name}\n` +
-                           `📁 ${category.emoji} ${category.name}\n\n` +
-                           `📍 Адрес: ${place.address || 'не указан'}\n` +
-                           `⏰ Время работы: ${place.working_hours || 'не указано'}\n` +
-                           (place.average_price ? `💰 Средний чек: ${place.average_price}\n` : '') +
-                           `\n📝 Описание:\n${place.description || 'Нет описания'}`;
-      
-      await this.sendAndTrack(chatId, simpleMessage, {
-        reply_markup: simpleKeyboard,
-        disable_web_page_preview: false
-      });
+        `📁 ${category.emoji} ${category.name}\n\n` +
+        `📍 Адрес: ${place.address || 'не указан'}\n` +
+        `⏰ Время работы: ${place.working_hours || 'не указано'}\n` +
+        (place.average_price ? `💰 Средний чек: ${place.average_price}\n` : '') +
+        `\n📝 Описание:\n${place.description || 'Нет описания'}`;
+
+      await this.editOrSend(chatId, simpleMessage, {
+        reply_markup: simpleKeyboard
+      }, photoUrl);
       return;
     }
 
-    // ✅ ОТПРАВЛЯЕМ С HTML И БЕЗ ПРЕДВАРИТЕЛЬНОГО ТЕСТА
+    // ✅ ОТПРАВЛЯЕМ / РЕДАКТИРУЕМ с фото
     try {
-      await this.sendAndTrack(chatId, message, {
+      await this.editOrSend(chatId, message, {
         parse_mode: 'HTML',
         reply_markup: inlineKeyboard,
         disable_web_page_preview: false
-      });
-      
+      }, photoUrl);
+
     } catch (error) {
       console.error('❌ Ошибка при отправке с HTML:', error.message);
-      
-      // АВАРИЙНЫЙ ВАРИАНТ: отправляем как plain text
+
+      // Пробуем plain text
       const plainText = this.htmlToPlainText(message);
       try {
-        await this.sendAndTrack(chatId, plainText, {
+        await this.editOrSend(chatId, plainText, {
           reply_markup: inlineKeyboard,
           disable_web_page_preview: false
-        });
+        }, photoUrl);
       } catch (finalError) {
         console.error('❌ Критическая ошибка:', finalError.message);
-        await this.sendAndTrack(chatId, `🏛️ ${place.name}\n📍 ${place.address || 'Адрес не указан'}`);
+        await this.editOrSend(
+          chatId,
+          `🏛️ ${place.name}\n📍 ${place.address || 'Адрес не указан'}`,
+          {},
+          null
+        );
       }
     }
 
@@ -3732,7 +3746,7 @@ if (safePhone) {
   } catch (error) {
     console.error('❌ Ошибка при показе деталей места:', error.message);
     console.error('❌ Stack trace:', error.stack);
-    await this.sendAndTrack(chatId, '⚠️ Произошла ошибка при загрузке информации о месте.');
+    await this.editOrSend(chatId, '⚠️ Произошла ошибка при загрузке информации о месте.', {}, null);
   }
 }
 // 🔥 ДОБАВИТЕ ЭТИ ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
@@ -5981,15 +5995,14 @@ async testUberLink(chatId, place) {
 
   // ============ ОСНОВНЫЕ МЕТОДЫ ИНТЕРФЕЙСА ============
 async showMainMenu(chatId, text = 'Выберите действие:', isAdmin = false) {
-  // Полностью очищаем все состояния
   this.userStates.delete(chatId);
   this.adminSessions.delete(chatId);
   this.userPhotos.delete(chatId);
   this.lastBotMessages.delete(chatId);
-  
-  console.log(`🎮 [showMainMenu] Показываю главное меню для ${chatId}, isAdmin: ${isAdmin}`);
-  
-  // Используем sendAdminMessage для гарантированной отправки (без удаления)
+  this.mainMessageId.delete(chatId); // ✅ сбрасываем главное сообщение
+  this.mainMessageId.delete(chatId);
+  this.mainMessageIsPhoto?.delete(chatId);
+
   await this.sendAdminMessage(chatId, `${text}\n\nВыберите действие:`, {
     reply_markup: this.getKeyboardWithMainMenu(isAdmin)
   });
@@ -6055,19 +6068,14 @@ async showCitySelection(chatId, isAdmin = false) {
   try {
     console.log(`🔍 [showCitySelection] Начинаю для ${chatId}`);
     
-    // Добавляем таймаут для запроса к Firebase
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('Таймаут получения городов из Firebase (10 секунд)')), 10000);
     });
     
-    const citiesPromise = cityManager.getAllCities();
-    const cities = await Promise.race([citiesPromise, timeoutPromise]);
-    
-    console.log(`🔍 [showCitySelection] Получено городов: ${cities.length}`, cities);
+    const cities = await Promise.race([cityManager.getAllCities(), timeoutPromise]);
     
     if (cities.length === 0) {
-      console.log(`⚠️ [showCitySelection] Список городов пуст`);
-      await this.sendAdminMessage(
+      await this.editOrSend(
         chatId,
         '📭 Список городов пуст.\n\n' +
         (isAdmin ? 'Вы можете добавить город через панель администратора.' : 'Обратитесь к администратору.')
@@ -6075,97 +6083,34 @@ async showCitySelection(chatId, isAdmin = false) {
       return;
     }
 
-    // ✅ СОРТИРУЕМ ГОРОДА ПО АЛФАВИТУ (русский алфавит учитывается)
     const sortedCities = [...cities].sort((a, b) => a.localeCompare(b, 'ru'));
-
     const message = '🏙️ *Выберите город:*';
-    console.log(`🔍 [showCitySelection] Создаю inline-кнопки для ${sortedCities.length} городов`);
 
-    const inlineKeyboard = {
-      inline_keyboard: []
-    };
+    const inlineKeyboard = { inline_keyboard: [] };
 
-    for (let i = 0; i < sortedCities.length; i += 1) {
+    for (let i = 0; i < sortedCities.length; i++) {
       const cityKey = this.getCityKey(sortedCities[i]);
-      console.log(`🔍 [showCitySelection] Город ${i+1}: "${sortedCities[i]}" -> ключ: "${cityKey}"`);
-
-      inlineKeyboard.inline_keyboard.push([
-        {
-          text: sortedCities[i],
-          callback_data: `select_city:${cityKey}`
-        }
-      ]);
+      inlineKeyboard.inline_keyboard.push([{
+        text: sortedCities[i],
+        callback_data: `select_city:${cityKey}`
+      }]);
     }
 
-    console.log(`🔍 [showCitySelection] Отправляю сообщение с клавиатурой`);
+    // Кнопка "Главное меню"
+    inlineKeyboard.inline_keyboard.push([
+      { text: '🏠 Главное меню', callback_data: 'back:main_menu' }
+    ]);
 
-    // Попробуем отправить разными способами
-    try {
-      // Способ 1: через sendAndTrack
-      const result = await this.sendAndTrack(chatId, message, {
-        parse_mode: 'Markdown',
-        reply_markup: inlineKeyboard
-      });
-      console.log(`✅ [showCitySelection] Сообщение отправлено через sendAndTrack, ID: ${result?.message_id}`);
-    } catch (error1) {
-      console.error(`❌ [showCitySelection] Ошибка sendAndTrack:`, error1.message);
-
-      try {
-        // Способ 2: через sendAdminMessage
-        const result2 = await this.sendAdminMessage(chatId, message, {
-          parse_mode: 'Markdown',
-          reply_markup: inlineKeyboard
-        });
-        console.log(`✅ [showCitySelection] Сообщение отправлено через sendAdminMessage, ID: ${result2?.message_id}`);
-      } catch (error2) {
-        console.error(`❌ [showCitySelection] Ошибка sendAdminMessage:`, error2.message);
-
-        try {
-          // Способ 3: через прямой вызов bot.sendMessage
-          const result3 = await this.bot.sendMessage(chatId, message, {
-            parse_mode: 'Markdown',
-            reply_markup: inlineKeyboard
-          });
-          console.log(`✅ [showCitySelection] Сообщение отправлено напрямую, ID: ${result3.message_id}`);
-        } catch (error3) {
-          console.error(`❌ [showCitySelection] Ошибка прямого вызова:`, error3.message);
-
-          // Способ 4: отправить без разметки
-          await this.bot.sendMessage(
-            chatId,
-            '🏙️ Выберите город из списка ниже:\n\n' +
-            sortedCities.map(c => `• ${c}`).join('\n') +
-            '\n\nНапишите название города:'
-          );
-        }
-      }
-    }
-
-    console.log(`✅ [showCitySelection] Завершено для ${chatId}`);
+    await this.editOrSend(chatId, message, {
+      parse_mode: 'Markdown',
+      reply_markup: inlineKeyboard
+}, null);
 
   } catch (error) {
     console.error(`❌ [showCitySelection] Ошибка:`, error);
-
-    if (error.message.includes('Таймаут')) {
-      await this.sendAdminMessage(
-        chatId,
-        '⏱️ *Таймаут запроса*\n\n' +
-        'Не удалось получить список городов из Firebase в течение 10 секунд.\n\n' +
-        'Возможные причины:\n' +
-        '1. Проблемы с подключением к Firebase\n' +
-        '2. Слишком медленный ответ от Firebase\n' +
-        '3. Ошибка в конфигурации Firebase\n\n' +
-        'Проверьте логи Firebase и сетевое подключение.'
-      );
-    } else {
-      await this.sendAdminMessage(
-        chatId,
-        `❌ Ошибка при загрузке городов: ${error.message}`
-      );
-    }
+    await this.editOrSend(chatId, `❌ Ошибка при загрузке городов: ${error.message}`);
   }
 }
-
 
 // 1. handleCitySelection - сортировка категорий с пагинацией
 async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
@@ -6180,7 +6125,6 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
   const stats = await placeManager.getCityStats(cityName);
   const cityData = await cityManager.getCityData(cityName);
   
-  // Собираем категории с местами
   const categoriesWithPlaces = [];
   for (const category of categories) {
     const count = stats.categoriesCount[category.id] ? stats.categoriesCount[category.id].count : 0;
@@ -6189,40 +6133,27 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
     }
   }
   
-  // Сортируем по алфавиту
   categoriesWithPlaces.sort((a, b) => a.name.localeCompare(b.name, 'ru'));
   
-  // Если нет категорий с местами — показываем все
   const allCategories = categoriesWithPlaces.length > 0
     ? categoriesWithPlaces
     : [...categories].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
   
-  // Пагинация: 10 категорий на страницу
   const pageSize = 10;
   const totalPages = Math.ceil(allCategories.length / pageSize);
   const currentPage = Math.max(0, Math.min(page, totalPages - 1));
   const start = currentPage * pageSize;
   const pageCategories = allCategories.slice(start, start + pageSize);
   
-  let message = `🏙️ *${cityName}*\n\n`;
+  let message = `🏙️ <b>${cityName}</b>\n\n`;
   if (totalPages > 1) {
     message += `Выберите категорию (стр. ${currentPage + 1}/${totalPages}):\n\n`;
   } else {
     message += `Выберите категорию:\n\n`;
   }
   
-  // Фото города
-  if (cityData && cityData.photo) {
-    if (cityData.photo.url) {
-      message = `[​](${cityData.photo.url})` + message;
-    } else if (cityData.photo.telegramFileId) {
-      message = `[​](${cityData.photo.telegramFileId})` + message;
-    }
-  }
-  
   const inlineKeyboard = { inline_keyboard: [] };
   
-  // Кнопки категорий по 2 в ряд, БЕЗ числа мест
   for (let i = 0; i < pageCategories.length; i += 2) {
     const row = pageCategories.slice(i, i + 2).map(cat => ({
       text: `${cat.emoji} ${cat.name}`,
@@ -6231,7 +6162,6 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
     inlineKeyboard.inline_keyboard.push(row);
   }
   
-  // Навигация по страницам
   if (totalPages > 1) {
     const navRow = [];
     if (currentPage > 0) {
@@ -6240,9 +6170,7 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
     if (currentPage < totalPages - 1) {
       navRow.push({ text: 'Далее ➡️', callback_data: `city_cat_page:${cityKey}:${currentPage + 1}` });
     }
-    if (navRow.length > 0) {
-      inlineKeyboard.inline_keyboard.push(navRow);
-    }
+    if (navRow.length > 0) inlineKeyboard.inline_keyboard.push(navRow);
   }
   
   if (isAdmin) {
@@ -6251,61 +6179,91 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
       { text: '✏️ Редактировать место', callback_data: `admin_action:edit_place:${cityKey}` }
     ]);
   }
+
+  inlineKeyboard.inline_keyboard.push([
+    { text: '🔙 К городам', callback_data: 'back:cities' },
+    { text: '🏠 Главное меню', callback_data: 'back:main_menu' }
+  ]);
+
+  // Получаем фото города
+  let cityPhotoUrl = null;
+  if (cityData && cityData.photo) {
+    if (cityData.photo.url) {
+      cityPhotoUrl = cityData.photo.url;
+    } else if (cityData.photo.telegramFileId) {
+      cityPhotoUrl = cityData.photo.telegramFileId;
+    }
+  }
   
-  await this.sendAndTrack(chatId, message, {
-    parse_mode: 'Markdown',
+  await this.editOrSend(chatId, message, {
+    parse_mode: 'HTML',
     reply_markup: inlineKeyboard
-  });
+  }, cityPhotoUrl);
 }
 
 // 2. showPlacesByCategory - сортировка мест
 async showPlacesByCategory(chatId, cityKey, categoryId, page = 0) {
-    const cityName = await this.getCityNameFromKey(cityKey);
-    const userId = this.userStates.get(chatId)?.userId || chatId;
-    const isAdmin = this.isUserAdmin(userId);
-    
-    const places = await placeManager.getPlacesByCategory(cityName, categoryId);
-    const category = await categoryManager.getCategoryById(categoryId);
-    
-    if (places.length === 0) {
-      await this.sendAndTrack(chatId, `В категории "${category.emoji} ${category.name}" пока нет мест.\n\nВыберите другую категорию.`);
-      return;
-    }
-    
-    const pageSize = 15;
-    const totalPages = Math.ceil(places.length / pageSize);
-    const start = page * pageSize;
-    const end = Math.min(start + pageSize, places.length);
-    
-    const sortedPlaces = [...places].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
-    const pagePlaces = sortedPlaces.slice(start, end);
-    
-    let message = `📍 *${category.emoji} ${category.name} в ${cityName}* (Стр. ${page + 1}/${totalPages})\n\n`;
-    message += `Выберите место:`;
-    
-    const inlineKeyboard = { inline_keyboard: [] };
-    
-    pagePlaces.forEach(place => {
-      const socialIcon = place.social_links && Object.keys(place.social_links).length > 0 ? ' 📱' : '';
-      inlineKeyboard.inline_keyboard.push([{
-        text: `${place.name}${socialIcon}${place.average_price ? ` (${place.average_price})` : ''}`,
-        callback_data: `show_place:${cityKey}:${place.id}`
-      }]);
-    });
-
-    const navRow = [];
-    if (page > 0) navRow.push({ text: '⬅️ Пред.', callback_data: `user_category_page:${cityKey}:${categoryId}:${page - 1}` });
-    if (page < totalPages - 1) navRow.push({ text: 'След. ➡️', callback_data: `user_category_page:${cityKey}:${categoryId}:${page + 1}` });
-    if (navRow.length > 0) inlineKeyboard.inline_keyboard.push(navRow);
-    
-    inlineKeyboard.inline_keyboard.push([
-      { text: '🔙 К категориям', callback_data: `select_city:${cityKey}` },
-      { text: '🏠 Меню', callback_data: 'back:main_menu' }
-    ]);
-    
-    this.cleanInlineKeyboard(inlineKeyboard);
-    await this.sendAndTrack(chatId, message, { parse_mode: 'Markdown', reply_markup: inlineKeyboard });
+  const cityName = await this.getCityNameFromKey(cityKey);
+  const userId = this.userStates.get(chatId)?.userId || chatId;
+  const isAdmin = this.isUserAdmin(userId);
+  
+  const places = await placeManager.getPlacesByCategory(cityName, categoryId);
+  const category = await categoryManager.getCategoryById(categoryId);
+  
+  if (places.length === 0) {
+    await this.editOrSend(
+      chatId,
+      `В категории "${category.emoji} ${category.name}" пока нет мест.\n\nВыберите другую категорию.`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🔙 К категориям', callback_data: `select_city:${cityKey}` },
+            { text: '🏠 Главное меню', callback_data: 'back:main_menu' }
+          ]]
+        }
+      }
+    );
+    return;
   }
+  
+  const pageSize = 15;
+  const totalPages = Math.ceil(places.length / pageSize);
+  const start = page * pageSize;
+  const end = Math.min(start + pageSize, places.length);
+  
+  const sortedPlaces = [...places].sort((a, b) => a.name.localeCompare(b.name, 'ru'));
+  const pagePlaces = sortedPlaces.slice(start, end);
+  
+  let message = `📍 *${category.emoji} ${category.name}* — ${cityName}`;
+  if (totalPages > 1) message += ` (стр. ${page + 1}/${totalPages})`;
+  message += `\n\nВыберите место:`;
+  
+  const inlineKeyboard = { inline_keyboard: [] };
+  
+  pagePlaces.forEach(place => {
+    inlineKeyboard.inline_keyboard.push([{
+      text: `${place.name}${place.average_price ? ` (${place.average_price})` : ''}`,
+      callback_data: `show_place:${cityKey}:${place.id}`
+    }]);
+  });
+
+  const navRow = [];
+  if (page > 0) navRow.push({ text: '⬅️ Пред.', callback_data: `user_category_page:${cityKey}:${categoryId}:${page - 1}` });
+  if (page < totalPages - 1) navRow.push({ text: 'След. ➡️', callback_data: `user_category_page:${cityKey}:${categoryId}:${page + 1}` });
+  if (navRow.length > 0) inlineKeyboard.inline_keyboard.push(navRow);
+  
+  inlineKeyboard.inline_keyboard.push([
+    { text: '🔙 К категориям', callback_data: `select_city:${cityKey}` },
+    { text: '🏠 Главное меню', callback_data: 'back:main_menu' }
+  ]);
+  
+  this.cleanInlineKeyboard(inlineKeyboard);
+  
+await this.editOrSend(chatId, message, {
+  parse_mode: 'Markdown',
+  reply_markup: inlineKeyboard
+}, null);
+}
 
  async showPlacesForEdit(chatId, cityName, page = 0) {
   const places = await placeManager.getPlacesByCity(cityName);
@@ -8265,14 +8223,16 @@ async syncDataToFirebase(chatId) {
 async handleBackAction(chatId, target, isAdmin) {
   switch(target) {
     case 'main_menu':
-      // Сбрасываем админ-сессию при возврате в главное меню
       this.adminSessions.delete(chatId);
+      this.mainMessageId.delete(chatId); // сбрасываем при выходе в главное меню
       await this.showMainMenu(chatId, 'Главное меню:', isAdmin);
+      break;
+    case 'cities':
+      await this.showCitySelection(chatId, isAdmin);
       break;
     case 'city':
       const state = this.userStates.get(chatId);
       if (state && state.selectedCity) {
-        // Используем ключ города для callback
         const cityKey = this.getCityKey(state.selectedCity);
         await this.handleCitySelection(chatId, cityKey, isAdmin);
       } else {
