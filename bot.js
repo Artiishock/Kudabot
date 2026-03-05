@@ -261,7 +261,6 @@ setTimeout(async () => {
 async editOrSend(chatId, text, options = {}, photoUrl = null) {
   const mainMsgId = this.mainMessageId.get(chatId);
 
-  // Если есть фото — добавляем невидимую ссылку в начало текста
   const textWithPhoto = photoUrl
     ? `<a href="${this.escapeHtmlAttribute(photoUrl)}">​</a>${text}`
     : text;
@@ -273,7 +272,7 @@ async editOrSend(chatId, text, options = {}, photoUrl = null) {
         message_id: mainMsgId,
         parse_mode: options.parse_mode || 'HTML',
         reply_markup: options.reply_markup,
-        disable_web_page_preview: false  // ← обязательно false чтобы превью работало
+        disable_web_page_preview: false
       });
       return { message_id: mainMsgId };
 
@@ -282,6 +281,8 @@ async editOrSend(chatId, text, options = {}, photoUrl = null) {
         return { message_id: mainMsgId };
       }
       console.log(`⚠️ editOrSend ошибка редактирования: ${error.message}`);
+      
+      // Пытаемся удалить старое сообщение
       try { await this.bot.deleteMessage(chatId, mainMsgId); } catch (e) {}
       this.mainMessageId.delete(chatId);
     }
@@ -291,7 +292,7 @@ async editOrSend(chatId, text, options = {}, photoUrl = null) {
   const msg = await this.bot.sendMessage(chatId, textWithPhoto, {
     ...options,
     parse_mode: options.parse_mode || 'HTML',
-    disable_web_page_preview: false  // ← false чтобы превью работало
+    disable_web_page_preview: false
   });
 
   this.mainMessageId.set(chatId, msg.message_id);
@@ -3900,51 +3901,58 @@ escapeHtml(text) {
   }
   // ============ ДОБАВЛЕННЫЙ МЕТОД ============
   async showAdminPanel(chatId) {
-    const cities = await cityManager.getAllCities();
-    const totalPlaces = await this.getTotalPlacesCount();
-    const categories = await categoryManager.getAllCategories();
-    const ads = await this.adsManager.getAllAds();
-    
-    let message = '👑 *Панель администратора*\n\n';
-    message += `📊 *Статистика:*\n`;
-    message += `├ Городов: ${cities.length}\n`;
-    message += `├ Всего мест: ${totalPlaces}\n`;
-    message += `├ Категорий: ${categories.length}\n`;
-    message += `└ Рекламных объявлений: ${ads.length}\n\n`;
-    message += `*Доступные действия:*`;
-    
-    const inlineKeyboard = {
-      inline_keyboard: [
-        [
-          { text: '➕ Добавить город', callback_data: 'admin_action:add_city' },
-          { text: '🗑️ Удалить город', callback_data: 'admin_action:remove_city' }
-        ],
-        [
-          { text: '📋 Список городов', callback_data: 'admin_action:list_cities' }
-        ],
-        [
-          { text: '➕ Добавить место', callback_data: 'admin_action:add_place' },
-          { text: '✏️ Редактировать место', callback_data: 'admin_action:edit_place' }
-        ],
-        [
-          { text: '📁 Управление категориями', callback_data: 'admin_action:manage_categories' }
-        ],
-        [
-          // ✅ НОВАЯ КНОПКА
-          { text: '📢 Управление рекламой', callback_data: 'admin_action:manage_ads' }
-        ],
-        [
-          { text: '📊 Статистика', callback_data: 'admin_action:stats' },
-          { text: '🔄 Обновить данные', callback_data: 'admin_action:refresh' }
-        ]
+  const cities = await cityManager.getAllCities();
+  const totalPlaces = await this.getTotalPlacesCount();
+  const categories = await categoryManager.getAllCategories();
+  const ads = await this.adsManager.getAllAds();
+  
+  // ✅ Получаем статистику пользователей
+  const userStats = await this.getUserStats();
+  
+  let message = '👑 *Панель администратора*\n\n';
+  message += `📊 *Статистика:*\n`;
+  message += `├ Городов: ${cities.length}\n`;
+  message += `├ Всего мест: ${totalPlaces}\n`;
+  message += `├ Категорий: ${categories.length}\n`;
+  message += `├ Рекламных объявлений: ${ads.length}\n`;
+  
+  // ✅ Красивый вывод пользователей
+  const newUsersText = userStats.last24h > 0 ? ` (+${userStats.last24h} за 24ч)` : '';
+  message += `└ Пользователей: ${userStats.total}${newUsersText}\n`;
+  
+  message += `\n*Доступные действия:*`;
+  
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        { text: '➕ Добавить город', callback_data: 'admin_action:add_city' },
+        { text: '🗑️ Удалить город', callback_data: 'admin_action:remove_city' }
+      ],
+      [
+        { text: '📋 Список городов', callback_data: 'admin_action:list_cities' }
+      ],
+      [
+        { text: '➕ Добавить место', callback_data: 'admin_action:add_place' },
+        { text: '✏️ Редактировать место', callback_data: 'admin_action:edit_place' }
+      ],
+      [
+        { text: '📁 Управление категориями', callback_data: 'admin_action:manage_categories' }
+      ],
+      [
+        { text: '📢 Управление рекламой', callback_data: 'admin_action:manage_ads' }
+      ],
+      [
+        { text: '📊 Статистика', callback_data: 'admin_action:stats' },
+        { text: '🔄 Обновить данные', callback_data: 'admin_action:refresh' }
       ]
-    };
-    
-    await this.sendAdminMessage(chatId, message, {
-      parse_mode: 'Markdown',
-      reply_markup: inlineKeyboard
-    });
-  }
+    ]
+  };
+  
+  await this.sendAdminMessage(chatId, message, {
+    parse_mode: 'Markdown',
+    reply_markup: inlineKeyboard
+  });
+}
 
   async handleAdminAction(chatId, action, param, messageId) {
     switch(action) {
@@ -4900,23 +4908,24 @@ this.bot.onText(/\/testuber/, async (msg) => {
 
 
     
-    this.bot.onText(/\/start/, async (msg) => {
-      const chatId = msg.chat.id;
-      const userId = msg.from.id;
-      const userName = msg.from.first_name;
-      const isAdmin = this.isUserAdmin(userId);
-      
-      // Сбрасываем админ-сессию при старте
-      this.adminSessions.delete(chatId);
-      
-      await this.deleteLastMessage(chatId);
-      
-      const welcomeText = `👋 Привет, ${userName}!\n\n` +
-                         `Я - ваш персональный гид по городам. Я помогу найти интересные места, ` +
-                         `расскажу о событиях и подскажу куда сходить.\n\n`;
-      
-      await this.showMainMenu(chatId, welcomeText, isAdmin);
-    });
+this.bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const userName = msg.from.first_name;
+  const isAdmin = this.isUserAdmin(userId);
+  
+  // ✅ Трекаем пользователя
+  await this.trackUser(msg);
+  
+  this.adminSessions.delete(chatId);
+  await this.deleteLastMessage(chatId);
+  
+  const welcomeText = `👋 Привет, ${userName}!\n\n` +
+                     `Я - ваш персональный гид по городам. Я помогу найти интересные места, ` +
+                     `расскажу о событиях и подскажу куда сходить.\n\n`;
+  
+  await this.showMainMenu(chatId, welcomeText, isAdmin);
+});
 
     this.bot.onText(/\/cities/, async (msg) => {
       const chatId = msg.chat.id;
@@ -5067,11 +5076,32 @@ this.bot.on('message', async (msg) => {
     
     if (!text) return;
     
-    // ✅ КРИТИЧЕСКИ ВАЖНО: Проверяем ГЛАВНОЕ МЕНЮ ПЕРВЫМ!
+    // ✅ ОБРАБОТКА КОМАНД ГЛАВНОГО МЕНЮ С ОЧИСТКОЙ ЧАТА
     if (text && this.isMainMenuCommand(text)) {
         console.log(`🎯 Обработка команды главного меню: "${text}"`);
+        
+        // Удаляем сообщение пользователя
+        try {
+            await this.bot.deleteMessage(chatId, msg.message_id);
+        } catch (e) {
+            console.log(`⚠️ Не удалось удалить сообщение пользователя: ${e.message}`);
+        }
+        
+        // Удаляем старое сообщение бота
+        const oldMsgId = this.mainMessageId.get(chatId);
+        if (oldMsgId) {
+            try {
+                await this.bot.deleteMessage(chatId, oldMsgId);
+            } catch (e) {
+                console.log(`⚠️ Не удалось удалить старое сообщение бота: ${e.message}`);
+            }
+        }
+        
+        // Сбрасываем mainMessageId чтобы editOrSend создал новое сообщение внизу
+        this.mainMessageId.delete(chatId);
+        
         await this.handleMainMenuCommand(chatId, text, isAdmin);
-        return;  // ВАЖНО: завершаем обработку
+        return;
     }
     
     // Если текст начинается с '/' - это команда, которая обрабатывается в onText
@@ -5094,16 +5124,13 @@ this.bot.on('message', async (msg) => {
             return;
         }
         
-        // Обработка ввода нового значения
         await this.processFieldEdit(chatId, text, userState);
         return;
     }
     
     // ✅ ТЕПЕРЬ ОБРАБАТЫВАЕМ ДРУГИЕ СОСТОЯНИЯ
     if (userState) {
-        // Проверяем, не пытается ли пользователь просматривать город
         if (userState.action === 'browsing_city') {
-            // Разрешаем обработку названий городов и категорий
             const cities = await cityManager.getAllCities();
             if (cities.includes(text)) {
                 await this.handleCitySelection(chatId, this.getCityKey(text), isAdmin);
@@ -5118,7 +5145,6 @@ this.bot.on('message', async (msg) => {
             }
         }
         
-        // Проверяем, не выбирает ли пользователь место
         if (userState.action === 'selecting_place') {
             const place = userState.places.find(p => p.name.substring(0, 30) === text || p.name === text);
             if (place) {
@@ -5127,20 +5153,17 @@ this.bot.on('message', async (msg) => {
             }
         }
         
-        // Для всех остальных состояний вызываем handleUserState
         await this.handleUserState(chatId, userId, msg, userState, isAdmin);
         return;
     }
     
     // ✅ ЕСЛИ НЕТ СОСТОЯНИЯ - ПРОВЕРЯЕМ, НЕ ГОРОД/КАТЕГОРИЯ ЛИ ЭТО
-    // Проверяем, это ли название города
     const cities = await cityManager.getAllCities();
     if (cities.includes(text)) {
         await this.handleCitySelection(chatId, this.getCityKey(text), isAdmin);
         return;
     }
     
-    // Проверяем, это ли название категории
     const categories = await categoryManager.getAllCategories();
     const category = categories.find(c => c.name === text);
     if (category && userState && userState.selectedCity) {
@@ -5999,13 +6022,73 @@ async showMainMenu(chatId, text = 'Выберите действие:', isAdmin 
   this.adminSessions.delete(chatId);
   this.userPhotos.delete(chatId);
   this.lastBotMessages.delete(chatId);
-  this.mainMessageId.delete(chatId); // ✅ сбрасываем главное сообщение
-  this.mainMessageId.delete(chatId);
+  this.mainMessageId.delete(chatId); // ✅ сбрасываем — новое сообщение появится внизу
   this.mainMessageIsPhoto?.delete(chatId);
 
   await this.sendAdminMessage(chatId, `${text}\n\nВыберите действие:`, {
     reply_markup: this.getKeyboardWithMainMenu(isAdmin)
   });
+}
+
+async trackUser(msg) {
+  try {
+    if (!this.firebaseDB || !this.firebaseDB.initialized) return;
+    
+    const userId = msg.from.id;
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    
+    const userRef = this.firebaseDB.db.ref(`users/${userId}`);
+    const snapshot = await userRef.once('value');
+    const existing = snapshot.val();
+    
+    await userRef.set({
+      userId: userId,
+      firstName: msg.from.first_name || '',
+      username: msg.from.username || null,
+      lastSeen: now,
+      firstSeen: existing?.firstSeen || now
+    });
+    
+  } catch (e) {
+    console.error('❌ Ошибка trackUser:', e.message);
+  }
+}
+
+async getUserStats() {
+  try {
+    if (!this.firebaseDB || !this.firebaseDB.initialized) {
+      return { total: 0, last24h: 0 };
+    }
+    
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    
+    const snapshot = await this.firebaseDB.db.ref('users').once('value');
+    
+    if (!snapshot.exists()) {
+      return { total: 0, last24h: 0 };
+    }
+    
+    let total = 0;
+    let last24h = 0;
+    
+    snapshot.forEach(child => {
+      const user = child.val();
+      total++;
+      
+      // Считаем пришедших за последние 24 часа по firstSeen
+      if (user.firstSeen && user.firstSeen >= oneDayAgo) {
+        last24h++;
+      }
+    });
+    
+    return { total, last24h };
+    
+  } catch (e) {
+    console.error('❌ Ошибка getUserStats:', e.message);
+    return { total: 0, last24h: 0 };
+  }
 }
 
  getKeyboardWithMainMenu(isAdmin = false) {
@@ -8121,6 +8204,7 @@ async showMediaLinks(chatId, isAdmin = false) {
 async showAdminStats(chatId) {
   const cities = await cityManager.getAllCities();
   const ads = await this.adsManager.getAllAds();
+  const userStats = await this.getUserStats();
   
   let totalPlaces = 0;
   const statsByCity = [];
@@ -8135,26 +8219,27 @@ async showAdminStats(chatId) {
   const totalAdViews = ads.reduce((sum, ad) => sum + (ad.views || 0), 0);
   
   let message = '📈 *Статистика системы:*\n\n';
-  message += `🏙️ Городов: ${cities.length}\n`;
-  message += `📍 Всего мест: ${totalPlaces}\n\n`;
+  
+  // ✅ Блок пользователей
+  message += `👥 *Пользователи:*\n`;
+  message += `├ Всего: ${userStats.total}\n`;
+  message += `└ Новых за 24ч: +${userStats.last24h}\n\n`;
+  
+  message += `🏙️ *Контент:*\n`;
+  message += `├ Городов: ${cities.length}\n`;
+  message += `└ Всего мест: ${totalPlaces}\n\n`;
   
   if (statsByCity.length > 0) {
-    message += `*Статистика по городам:*\n`;
+    message += `*По городам:*\n`;
     statsByCity.forEach(stat => {
       message += `• ${stat.city}: ${stat.places} мест\n`;
     });
   }
   
-  // ✅ ДОБАВЬТЕ СТАТИСТИКУ ПО РЕКЛАМЕ
   if (ads.length > 0) {
-    message += `\n📢 *Статистика рекламы:*\n`;
-    message += `• Всего объявлений: ${ads.length}\n`;
-    message += `• Всего показов: ${totalAdViews}\n`;
-    
-    if (totalAdViews > 0) {
-      const avgViews = Math.round(totalAdViews / ads.length);
-      message += `• Среднее показов на объявление: ${avgViews}\n`;
-    }
+    message += `\n📢 *Реклама:*\n`;
+    message += `├ Объявлений: ${ads.length}\n`;
+    message += `└ Всего показов: ${totalAdViews}\n`;
   }
   
   const inlineKeyboard = {
@@ -8169,8 +8254,13 @@ async showAdminStats(chatId) {
     ]
   };
   
-  await this.sendAdminMessage(chatId, message, { parse_mode: 'Markdown', reply_markup: inlineKeyboard });
+  await this.sendAdminMessage(chatId, message, { 
+    parse_mode: 'Markdown', 
+    reply_markup: inlineKeyboard 
+  });
 }
+
+
 
 // ✅ НОВЫЙ МЕТОД для синхронизации данных в Firebase
 async syncDataToFirebase(chatId) {
