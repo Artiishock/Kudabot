@@ -6278,7 +6278,7 @@ async handleCitySelection(chatId, cityKey, isAdmin, page = 0) {
 
   inlineKeyboard.inline_keyboard.push([
     { text: '🔙 К городам', callback_data: 'back:cities' },
-    { text: '🏠 Главное меню', callback_data: 'back:main_menu' }
+    { text: ' 🏠 Главное меню', callback_data: 'back:main_menu' }
   ]);
 
   let cityPhotoUrl = null;
