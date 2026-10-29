@@ -13,3 +13,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+# Firebase service account credentials: never commit
+serviceAccountKey.json
+*-firebase-adminsdk-*.json
